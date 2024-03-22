@@ -1,0 +1,423 @@
+defaults:
+  - requires_package: &requires_package
+      requires:
+        - build-package
+
+workflows:
+  version: 2.1
+  node-multi-build:
+    jobs:
+      - check-coding-style
+      - node-v10
+      - node-v12
+      - node-v14
+      - node-v16
+      - node-v18
+      - node-v20
+      - node-current:
+          run_coveralls: true
+      - build-package
+      - hardhat-core-default-solc: *requires_package
+      - hardhat-core-latest-solc: *requires_package
+      - hardhat-sample-project: *requires_package
+      - cli-smoke-test: *requires_package
+      - solidity-solcjs-ext-test
+
+version: 2.1
+
+orbs:
+  shellcheck: circleci/shellcheck@volatile
+
+commands:
+  show-npm-version:
+    steps:
+      - run:
+          name: Versions
+          command: |
+            npm version
+            yarn --version
+            pnpm version || >&2 echo "pnpm not installed"
+
+  install-pnpm:
+    steps:
+      - run:
+          name: Install pnpm
+          command: sudo npm install -g pnpm
+
+  update-npm:
+    steps:
+      - run:
+          name: Update globally available npm to the latest version
+          # Note: We need npm >= 8.3 which supports 'overrides' in package.json
+          command: sudo npm update npm --location=global
+
+  install-dependencies:
+    parameters:
+      cache-id:
+        type: string
+      path:
+        type: string
+        default: .
+      package-manager:
+        type: string
+        default: npm
+      dependency-file:
+        type: string
+        default: package.json
+    steps:
+      - restore_cache:
+          name: "Restoring <<parameters.cache-id>> cache"
+          key: <<parameters.cache-id>>-dependency-cache-v4-{{ .Environment.CIRCLE_JOB }}-{{ checksum "<<parameters.path>>/<<parameters.dependency-file>>" }}
+      - run:
+          name: "<<parameters.package-manager>> install in <<parameters.path>>"
+          command: |
+            cd "<<parameters.path>>"
+            if [[ ! -e node_modules/ ]]; then
+              if [[ "<<parameters.package-manager>>" == "pnpm" ]]; then
+                # Create a flat node_modules without symlinks. Same as the node_modules created by npm or Yarn.
+                <<parameters.package-manager>> install --node-linker=hoisted
+              else
+                <<parameters.package-manager>> install
+              fi
+            fi
+      - save_cache:
+          name: "Saving <<parameters.cache-id>> cache"
+          key: <<parameters.cache-id>>-dependency-cache-v4-{{ .Environment.CIRCLE_JOB }}-{{ checksum "<<parameters.path>>/<<parameters.dependency-file>>" }}
+          paths:
+            - "<<parameters.path>>/node_modules/"
+
+  inject-solc-js-tarball:
+    description: "Recursively finds and replaces all instances of solc-js module installed in node_modules/ with the one from a tarball."
+    parameters:
+      path:
+        type: string
+        default: .
+      tarball-path:
+        type: string
+        default: workspace/solc-js.tgz
+      package-manager:
+        type: enum
+        enum: ["npm", "yarn", "pnpm"]
+        default: npm
+    steps:
+      - run:
+          name: "Sanity check: tarball exists and the target dir contains a JS project"
+          command: |
+            [[ -f "<<parameters.tarball-path>>" ]]
+            [[ -f "<<parameters.path>>/package.json" ]]
+      - run:
+          name: Inject solc-js from the tarball into dependencies at <<parameters.path>>
+          command: |
+            absolute_tarball_path=$(realpath "<<parameters.tarball-path>>")
+            cd "<<parameters.path>>"
+            mv package.json original-package.json
+            # NOTE: The 'overrides' feature requires npm >= 8.3. Yarn requires `resolutions` instead.
+            jq ". + {overrides: {solc: \"${absolute_tarball_path}\"}} + {resolutions: {solc: \"${absolute_tarball_path}\"}}" original-package.json > package.json
+            if [[ "<<parameters.package-manager>>" == "pnpm" ]]; then
+              <<parameters.package-manager>> install --no-frozen-lockfile --node-linker=hoisted
+            else
+              <<parameters.package-manager>> install --no-frozen-lockfile
+            fi
+      - run:
+          name: "Sanity check: all transitive dependencies successfully replaced with the tarball"
+          command: |
+            solc_version=$(
+              tar --extract --to-stdout --file "<<parameters.tarball-path>>" package/package.json |
+              jq --raw-output .version
+            )
+            cd "<<parameters.path>>"
+            if [[ "<<parameters.package-manager>>" == "pnpm" ]]; then
+              dependency_version=$(pnpm list --depth Infinity solc | grep "solc" | grep -v "solc ${solc_version}" || true)
+            else
+              dependency_version=$(<<parameters.package-manager>> list solc | grep "solc@" | grep -v "solc@${solc_version}" || true)
+            fi
+            if [[ -n "${dependency_version}" ]]; then
+              echo "Another version of solc-js is still present in the dependency tree."
+              exit 1
+            fi
+
+  provision-hardhat-with-packaged-solcjs:
+    description: "Clones Hardhat repository and configures it to use a local clone of solc-js."
+    steps:
+      - run: git clone --depth 1 "https://github.com/nomiclabs/hardhat" hardhat/
+      - install-dependencies:
+          cache-id: hardhat
+          path: hardhat
+          package-manager: pnpm
+          dependency-file: pnpm-lock.yaml
+      - inject-solc-js-tarball:
+          path: hardhat/
+          package-manager: pnpm
+
+jobs:
+  node-base: &node-base
+    working_directory: ~/solc-js
+    docker:
+      - image: cimg/node:current
+    parameters:
+      run_coveralls:
+        type: boolean
+        default: false
+    steps:
+      # We want the default npm here. Older one might not work with older node.js
+      - show-npm-version
+      - checkout
+      - install-dependencies:
+          cache-id: solc-js
+      - run:
+          name: updateBinary
+          command: npm run updateBinary
+      - run:
+          name: test
+          command: npm run test
+      - when:
+          condition: <<parameters.run_coveralls>>
+          steps:
+            - run:
+                name: coveralls
+                command: npm run coveralls
+
+  check-coding-style:
+    docker:
+      - image: cimg/node:current
+    steps:
+      - show-npm-version
+      - checkout
+      - shellcheck/install
+      - install-dependencies:
+          cache-id: solc-js
+      - run:
+          name: Check for javascript/typescript coding style
+          command: npm run lint
+      - shellcheck/check:
+          ignore-dirs: |
+            ./.git
+            ./node_modules
+            ./dist
+
+  build-package:
+    docker:
+      - image: cimg/node:current
+    steps:
+      - show-npm-version
+      - checkout:
+          path: solc-js/
+      - install-dependencies:
+          cache-id: solc-js
+          path: solc-js
+      - attach_workspace:
+          at: workspace
+      - run:
+          name: Package solc-js
+          command: |
+            cd solc-js/
+            npm run build:tarball
+
+            cp "$(npm run --silent tarballName)" ../workspace/solc-js.tgz
+
+            # The artifact is meant to be used with `npm publish` and that fails unless the file name includes a version number.
+            # Oddly, the name and version from the file name do not even need to be correct - after npm accepts the file,
+            # it will use the ones from package.json anyway.
+            mkdir ../artifacts
+            mv "$(npm run --silent tarballName)" ../artifacts/
+      - persist_to_workspace:
+          root: workspace
+          paths:
+            - solc-js.tgz
+      - store_artifacts:
+          path: artifacts/
+
+  hardhat-core-default-solc:
+    # Runs out of memory on 'medium'.
+    resource_class: medium+
+    environment:
+      NODE_OPTIONS: "--max-old-space-size=4096"
+    docker:
+      - image: cimg/rust:1.74.0-node
+    steps:
+      - install-pnpm
+      - show-npm-version
+      - attach_workspace:
+          at: workspace
+      - provision-hardhat-with-packaged-solcjs
+      - run:
+          name: Restore the default solc binary expected by Hardhat
+          command: |
+            # Hardhat downloader tests are hard-coded to expect the version that comes with the solc-js.
+            # We forced latest solc-js but we still want the default binary with it.
+            hardhat_default_solc_version=$(jq --raw-output '.dependencies.solc' hardhat/packages/hardhat-core/package.json)
+            mkdir hardhat-default-solc/
+            pushd hardhat-default-solc/
+            pnpm install --node-linker=hoisted "solc@${hardhat_default_solc_version}"
+            popd
+            ln -sf ../../../hardhat-default-solc/node_modules/solc/soljson.js hardhat/node_modules/solc/soljson.js
+      - run:
+          name: Run hardhat-core test suite with its default solc binary
+          command: |
+            cd hardhat/packages/hardhat-core
+            # The install command is required again here to create the correct symlinks under the hardhat-core/node_modules
+            # In our case that is something like: solc -> ../../../node_modules/.pnpm/file+..+solc-js.tgz/node_modules/solc
+            # See: https://pnpm.io/symlinked-node-modules-structure
+            pnpm install
+            # TODO: temporarily set hardhat stack traces tests to use cancun hardfork
+            # Remove this when hardhat switch to cancun by default: https://github.com/NomicFoundation/hardhat/issues/4851
+            sed -i 's/hardfork: "shanghai",/hardfork: "cancun",/' test/internal/hardhat-network/stack-traces/execution.ts
+            pnpm test
+
+  hardhat-core-latest-solc:
+    docker:
+      - image: cimg/rust:1.74.0-node
+    steps:
+      - install-pnpm
+      - show-npm-version
+      - attach_workspace:
+          at: workspace
+      - provision-hardhat-with-packaged-solcjs
+      - run:
+          name: Run hardhat-core test suite with latest solc
+          command: |
+            cd hardhat/
+            HARDHAT_TESTS_SOLC_PATH="${PWD}/node_modules/solc/soljson.js"
+            HARDHAT_TESTS_SOLC_VERSION=$(jq --raw-output .version node_modules/solc/package.json)
+            export HARDHAT_TESTS_SOLC_PATH HARDHAT_TESTS_SOLC_VERSION
+
+            cd packages/hardhat-core/
+            pnpm install
+            # TODO: temporarily set hardhat stack traces tests to use cancun hardfork
+            # Remove this when hardhat switch to cancun by default: https://github.com/NomicFoundation/hardhat/issues/4851
+            sed -i 's/hardfork: "shanghai",/hardfork: "cancun",/' test/internal/hardhat-network/stack-traces/execution.ts
+            pnpm test
+
+  hardhat-sample-project:
+    docker:
+      - image: cimg/node:current
+    steps:
+      - show-npm-version
+      - attach_workspace:
+          at: workspace
+      - run: git clone --depth 1 "https://github.com/nomiclabs/hardhat-hackathon-boilerplate" boilerplate/
+      - run:
+          # Leaving package-lock.json causes a weird error in arborist when npm is used again after
+          # `npm install`: 'The "from" argument must be of type string. Received undefined'
+          name: Neutralize package-lock.json
+          command: rm boilerplate/package-lock.json
+      - install-dependencies:
+          cache-id: hardhat-hackathon-boilerplate
+          path: boilerplate
+      - run:
+          name: Update to the latest Hardhat release
+          command: |
+            # We can just use a release here because injection does not require rebuilding it.
+            cd boilerplate/
+            npm update hardhat
+      - inject-solc-js-tarball:
+          path: boilerplate/
+      - run:
+          name: Configure the boilerplate project to force Hardhat not to use a native binary
+          command: |
+            cd boilerplate/
+
+            solc_version=$(jq --raw-output .version node_modules/solc/package.json)
+
+            sed -i 's|pragma solidity [^;]\+;|pragma solidity *;|g' contracts/Token.sol
+
+            {
+              echo "const {TASK_COMPILE_SOLIDITY_GET_SOLC_BUILD} = require('hardhat/builtin-tasks/task-names');"
+              echo "const assert = require('assert');"
+              echo
+              echo "subtask(TASK_COMPILE_SOLIDITY_GET_SOLC_BUILD, async (args, hre, runSuper) => {"
+              echo "    assert(args.solcVersion == '${solc_version}', 'Unexpected solc version: ' + args.solcVersion);"
+              echo "    return {"
+              echo "        compilerPath: '$(realpath "node_modules/solc/soljson.js")',"
+              echo "        isSolcJs: true,"
+              echo "        version: args.solcVersion,"
+              echo "        longVersion: args.solcVersion"
+              echo "    };"
+              echo "})"
+              echo "module.exports = {solidity: '${solc_version}'};"
+            } >> hardhat.config.js
+      - run:
+          name: Build and test the boilerplate project with local Hardhat
+          command: |
+            cd boilerplate/
+            npm run test
+
+  cli-smoke-test:
+    docker:
+      - image: cimg/node:current
+    steps:
+      - show-npm-version
+      - attach_workspace:
+          at: workspace
+      - run:
+          name: "CLI smoke test (package)"
+          command: |
+            mkdir package/
+            cd package/
+            npm install ../workspace/solc-js.tgz
+
+            npx solcjs --version
+
+            echo "contract C {}" > C.sol
+            npx solcjs C.sol --bin
+            [[ -f C_sol_C.bin ]]
+      - checkout:
+          path: solc-js/
+      - install-dependencies:
+          cache-id: solc-js
+          path: solc-js
+      - run:
+          name: Build solc-js
+          command: |
+            cd solc-js/
+            npm run updateBinary
+            npm run build
+      - run:
+          name: "CLI smoke test (repository)"
+          command: |
+            cd solc-js
+            dist/solc.js --version
+
+            echo "contract C {}" > C.sol
+            dist/solc.js C.sol --bin
+            [[ -f C_sol_C.bin ]]
+
+  solidity-solcjs-ext-test:
+    docker:
+      - image: circleci/node
+    steps:
+      - show-npm-version
+      - checkout:
+          path: solc-js/
+      - run: git clone --depth 1 "https://github.com/ethereum/solidity" solidity/
+      - run: cd solidity/ && curl "https://binaries.soliditylang.org/bin/soljson-nightly.js" --location --output soljson.js
+      - run: cd solidity/ && test/externalTests/solc-js/solc-js.sh "$(realpath soljson.js)" "$(scripts/get_version.sh)" "$(realpath ../solc-js/)"
+
+  node-v10:
+    <<: *node-base
+    docker:
+      - image: cimg/node:10.24
+  node-v12:
+    <<: *node-base
+    docker:
+      - image: cimg/node:12.22
+  node-v14:
+    <<: *node-base
+    docker:
+      - image: cimg/node:14.21
+  node-v16:
+    <<: *node-base
+    docker:
+      - image: cimg/node:16.20
+  node-v18:
+    <<: *node-base
+    docker:
+      - image: cimg/node:18.18
+  node-v20:
+    <<: *node-base
+    docker:
+      - image: cimg/node:20.9
+  node-current:
+    <<: *node-base
+    docker:
+      - image: cimg/node:current
